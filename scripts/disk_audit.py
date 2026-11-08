@@ -66,7 +66,45 @@ def inventory(roots, minimum, issues, skipped, excluded=()):
             issues.append({'path': str(path), 'error': str(error)})
 
 
-def hash_file(file, limit, issues):
+PREFIX_BYTES = 64 * 1024
+
+
+class ReadProgress:
+    def __init__(self, groups):
+        self.expected = sum(self.budget(size, files) for size, files in groups)
+        self.read = 0
+        self.started = self.last_update = time.monotonic()
+
+    @staticmethod
+    def budget(size, files):
+        return (min(size, PREFIX_BYTES) + size) * len(files)
+
+    def record(self, count):
+        self.read += count
+        self.show()
+
+    def show(self, force=False):
+        now = time.monotonic()
+        if not force and now - self.last_update < 5:
+            return
+        self.last_update = now
+        remaining = max(0, self.expected - self.read)
+        percent = self.read / self.expected if self.expected else 1
+        elapsed = now - self.started
+        eta = 'pending'
+        if not remaining:
+            eta = '0s'
+        elif self.read and elapsed >= 5:
+            seconds = round(remaining * elapsed / self.read)
+            minutes, seconds = divmod(seconds, 60)
+            hours, minutes = divmod(minutes, 60)
+            eta = f'{hours:d}h {minutes:02d}m {seconds:02d}s'
+        gib = 1024 ** 3
+        print(f'Comparison: {self.read / gib:.3f}/{self.expected / gib:.3f} GiB '
+              f'({percent:.1%}), ETA {eta}', file=sys.stderr, flush=True)
+
+
+def hash_file(file, limit, issues, progress=None):
     digest = hashlib.sha256()
     try:
         with file.path.open('rb') as stream:
@@ -75,8 +113,13 @@ def hash_file(file, limit, issues):
             if limit is None:
                 for chunk in iter(lambda: stream.read(1024 * 1024), b''):
                     digest.update(chunk)
+                    if progress is not None:
+                        progress.record(len(chunk))
             else:
-                digest.update(stream.read(limit))
+                chunk = stream.read(limit)
+                digest.update(chunk)
+                if progress is not None:
+                    progress.record(len(chunk))
             if (signature(os.fstat(stream.fileno())) != file.signature
                     or signature(file.path.lstat()) != file.signature):
                 raise OSError('File changed during hashing')
@@ -92,17 +135,24 @@ def candidates(buckets, cross_volume):
                                    len({file.volume for file in files}) > 1))
 
 
-def compare(same_size, cross_volume, issues):
+def compare(same_size, cross_volume, issues, progress=None):
     groups = []
     prefixes = defaultdict(list)
+    size = same_size[0].size
+    before = progress.read if progress is not None else 0
     for file in same_size:
-        digest = hash_file(file, 64 * 1024, issues)
+        digest = hash_file(file, PREFIX_BYTES, issues, progress)
         if digest is not None:
             prefixes[digest].append(file)
-    for _, same_prefix in candidates(prefixes, cross_volume):
+    prefix_groups = list(candidates(prefixes, cross_volume))
+    full_budget = sum(size * len(files) for _, files in prefix_groups)
+    if progress is not None:
+        progress.expected += progress.read - before + full_budget - progress.budget(size, same_size)
+        before = progress.read
+    for _, same_prefix in prefix_groups:
         hashes = defaultdict(list)
         for file in same_prefix:
-            digest = hash_file(file, None, issues)
+            digest = hash_file(file, None, issues, progress)
             if digest is not None:
                 hashes[digest].append(file)
         for digest, files in candidates(hashes, cross_volume):
@@ -113,6 +163,8 @@ def compare(same_size, cross_volume, issues):
             groups.append({'sha256': digest, 'size_bytes': size,
                            'duplicate_bytes': (len(files) - 1) * size,
                            'paths_by_volume': dict(by_volume)})
+    if progress is not None:
+        progress.expected += progress.read - before - full_budget
     return groups
 
 
@@ -188,7 +240,7 @@ def scan(roots, config, progress, db, excluded):
     groups = []
     cross_volume = config['cross_volume_only']
     size_groups = list(candidates(sizes, cross_volume))
-    total = len(size_groups)
+    cached = {}
     if db is not None:
         # Drop results whose candidate membership or metadata changed on disk.
         with db:
@@ -196,30 +248,36 @@ def scan(roots, config, progress, db, excluded):
                 files = sizes.get(size, [])
                 if len(files) < 2 or fingerprint != checkpoint_key(files):
                     db.execute('DELETE FROM comparisons WHERE size = ?', (size,))
+                else:
+                    cached[size] = fingerprint
     if progress:
         print(f'Inventory complete: {count:,} eligible files', file=sys.stderr, flush=True)
-        print(f'Comparison: 0/{total:,} groups checked', file=sys.stderr, flush=True)
-        last_update = time.monotonic()
-    for completed, (size, same_size) in enumerate(size_groups, 1):
+        tracker = ReadProgress((size, files) for size, files in size_groups if size not in cached)
+        tracker.show(force=True)
+    else:
+        tracker = None
+    for size, same_size in size_groups:
         saved = None
         if db is not None:
-            fingerprint = checkpoint_key(same_size)
+            fingerprint = cached.get(size) or checkpoint_key(same_size)
             saved = db.execute('SELECT result FROM comparisons WHERE size = ? AND fingerprint = ?',
                                (size, fingerprint)).fetchone()
         if saved is not None:
             groups.extend(json.loads(saved[0]))
+            if tracker is not None and size not in cached:
+                tracker.expected -= tracker.budget(size, same_size)
         else:
             issue_count = len(issues)
-            found = compare(same_size, cross_volume, issues)
+            if tracker is not None and size in cached:
+                tracker.expected += tracker.budget(size, same_size)
+            found = compare(same_size, cross_volume, issues, tracker)
             groups.extend(found)
             if db is not None and len(issues) == issue_count:
                 with db:
                     db.execute('INSERT OR REPLACE INTO comparisons VALUES (?, ?, ?)',
                                (size, fingerprint, json.dumps(found)))
-        if progress and (completed == total or time.monotonic() - last_update >= 5):
-            print(f'Comparison: {completed:,}/{total:,} groups checked ({completed / total:.0%})',
-                  file=sys.stderr, flush=True)
-            last_update = time.monotonic()
+    if tracker is not None:
+        tracker.show(force=True)
     return report(config, count, skipped, issues, groups)
 
 
